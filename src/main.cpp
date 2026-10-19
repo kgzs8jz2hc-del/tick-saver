@@ -2,13 +2,14 @@
 //
 // HALF-TICK DECISION (requirement 6)
 // ----------------------------------
-// One "tick" == one call of GJBaseGameLayer::processCommands(dt) on the PlayLayer.
-// The tick counter is an integer; there are NO half ticks. An input belongs to the
-// tick in whose processCommands call GJBaseGameLayer::handleButton fires for it
-// (i.e. sub-step timing is floored to the step that consumes it). Snapshots are
-// taken at the START of a tick (before inputs of that tick are applied), and each
-// snapshot stores the dt that tick was run with, so replays use identical steps
-// even if a TPS bypass / time warp is active.
+// In GD 2.2081 the entry point is processCommands(float dt, bool isHalfTick, bool isLastTick).
+// DECISION: the unit of time is ONE processCommands CALL ("step"), whatever its flags.
+// Every call (half or full) increments the step counter by exactly 1, gets its own
+// snapshot, and its own log slot. The exact (dt, isHalfTick, isLastTick) triple of each
+// step is stored in its snapshot and re-used verbatim in replays, so replays are
+// bit-identical in structure to the real run. Consequence: "N ticks" of shift means N
+// steps; if the game issues two calls per 240 Hz tick, one step is half a tick.
+// An input belongs to the step in whose processCommands call handleButton fires for it.
 //
 // OVERVIEW
 // --------
@@ -44,10 +45,18 @@ constexpr int kShiftTable[] = {0, 1, 2, 4, 8, 16};
 constexpr int kShiftCount = 6;
 constexpr double kSurviveSeconds = 0.100;
 
+struct Step {
+    float dt;
+    bool half;
+    bool last;
+};
+
 struct Snap {
     int64_t tick;
     CheckpointObject* cp; // retained by us
     float dt;
+    bool half;
+    bool last;
 };
 
 struct Input {
@@ -135,11 +144,11 @@ inline void applyHeldState(GJBaseGameLayer* self, std::vector<Input> const& log,
     }
 }
 
-inline float dtFor(int64_t t, float curDt) {
+inline Step stepFor(int64_t t, Step cur) {
     for (auto const& s : g.ring) {
-        if (s.tick == t) return s.dt;
+        if (s.tick == t) return {s.dt, s.half, s.last};
     }
-    return curDt;
+    return cur;
 }
 
 // Phase A (collect == false): replay from `base` and report whether the player
@@ -147,7 +156,7 @@ inline float dtFor(int64_t t, float curDt) {
 // Phase B (collect == true): replay again, taking a snapshot at the start of every
 // tick up to and including T+1 (the state we continue the real run from).
 inline bool runTrial(GJBaseGameLayer* self, PlayLayer* pl, Snap const& base,
-                     std::vector<Input> const& cand, int64_t T, float curDt,
+                     std::vector<Input> const& cand, int64_t T, Step cur,
                      int surviveTicks, bool collect, std::vector<Snap>* out) {
     g.trialDied = false;
     pl->loadFromCheckpoint(base.cp);
@@ -161,14 +170,16 @@ inline bool runTrial(GJBaseGameLayer* self, PlayLayer* pl, Snap const& base,
         if (collect) {
             auto* cp = pl->createCheckpoint();
             if (cp) cp->retain();
-            out->push_back({t, cp, dtFor(t, curDt)});
+            auto st = stepFor(t, cur);
+            out->push_back({t, cp, st.dt, st.half, st.last});
             if (t == T + 1) break; // inputs of T+1 are applied by the real run
         }
         while (ei < cand.size() && cand[ei].tick <= t) {
             self->handleButton(cand[ei].down, cand[ei].button, cand[ei].p1);
             ++ei;
         }
-        self->processCommands(dtFor(t, curDt));
+        auto st = stepFor(t, cur);
+        self->processCommands(st.dt, st.half, st.last);
         if (g.trialDied) return false;
     }
     return true;
@@ -176,7 +187,7 @@ inline bool runTrial(GJBaseGameLayer* self, PlayLayer* pl, Snap const& base,
 
 // Called at the start of tick T+1 with g.inReplay already set.
 // Returns true if a shifted replay was committed.
-inline bool tryRescue(GJBaseGameLayer* self, PlayLayer* pl, float curDt) {
+inline bool tryRescue(GJBaseGameLayer* self, PlayLayer* pl, Step cur) {
     int const N = maxShift();
     int64_t const T = g.deathTick;
 
@@ -192,7 +203,7 @@ inline bool tryRescue(GJBaseGameLayer* self, PlayLayer* pl, float curDt) {
         if (g.log[i].button == I.button && g.log[i].p1 == I.p1) { prevSame = g.log[i].tick; break; }
     }
 
-    int surviveTicks = static_cast<int>(std::ceil(kSurviveSeconds / std::max(1e-6f, curDt)));
+    int surviveTicks = static_cast<int>(std::ceil(kSurviveSeconds / std::max(1e-6f, cur.dt)));
     surviveTicks = std::clamp(surviveTicks, 1, 240);
 
     // Save the present (post-swallowed-death) state so a failed rescue is lossless.
@@ -221,11 +232,11 @@ inline bool tryRescue(GJBaseGameLayer* self, PlayLayer* pl, float curDt) {
                 [](Input const& a, Input const& b) { return a.tick < b.tick; });
 
             pl->m_queuedButtons.clear();
-            if (!runTrial(self, pl, *base, cand, T, curDt, surviveTicks, false, nullptr)) continue;
+            if (!runTrial(self, pl, *base, cand, T, cur, surviveTicks, false, nullptr)) continue;
 
             std::vector<Snap> snaps;
             pl->m_queuedButtons.clear();
-            bool ok = runTrial(self, pl, *base, cand, T, curDt, surviveTicks, true, &snaps);
+            bool ok = runTrial(self, pl, *base, cand, T, cur, surviveTicks, true, &snaps);
             if (!ok || snaps.empty() || snaps.back().tick != T + 1 || !snaps.back().cp) {
                 for (auto& s : snaps) freeSnap(s);
                 continue;
@@ -291,16 +302,16 @@ $execute {
 }
 
 class $modify(TSBase, GJBaseGameLayer) {
-    void processCommands(float dt) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (ts::g.inReplay) {
-            GJBaseGameLayer::processCommands(dt);
+            GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
             return;
         }
 
         auto* pl = PlayLayer::get();
         auto* self = static_cast<GJBaseGameLayer*>(this);
         if (!pl || static_cast<GJBaseGameLayer*>(pl) != self) {
-            GJBaseGameLayer::processCommands(dt);
+            GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
             return;
         }
 
@@ -312,7 +323,7 @@ class $modify(TSBase, GJBaseGameLayer) {
             bool saved = false;
             if (ts::maxShift() > 0) {
                 g.inReplay = true;
-                saved = ts::tryRescue(self, pl, dt);
+                saved = ts::tryRescue(self, pl, ts::Step{dt, isHalfTick, isLastTick});
                 g.inReplay = false;
             }
             g.pending = false;
@@ -344,7 +355,7 @@ class $modify(TSBase, GJBaseGameLayer) {
             if (!dead) {
                 if (auto* cp = pl->createCheckpoint()) {
                     cp->retain();
-                    g.ring.push_back({g.tick, cp, dt});
+                    g.ring.push_back({g.tick, cp, dt, isHalfTick, isLastTick});
                 }
                 while (g.ring.size() > ts::ringDepth()) {
                     ts::freeSnap(g.ring.front());
@@ -355,7 +366,7 @@ class $modify(TSBase, GJBaseGameLayer) {
             ts::clearRing(); // feature switched off: free everything
         }
 
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         g.tick++;
     }
 
