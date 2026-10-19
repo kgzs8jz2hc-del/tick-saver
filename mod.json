@@ -7,10 +7,10 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"id": "yourname.tick-saver",
+	"id": "baget.tick-saver",
 	"name": "Tick Saver",
 	"version": "v1.0.0",
-	"developer": "YourName",
+	"developer": "baget",
 	"description": "Experimental input-buffering / tick-saving study tool: rewinds a few physics ticks on death and retries with the last input shifted.",
 	"settings": {
 		"cycle-shift": {
