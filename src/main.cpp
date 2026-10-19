@@ -207,8 +207,8 @@ inline bool tryRescue(GJBaseGameLayer* self, PlayLayer* pl, Step cur) {
     surviveTicks = std::clamp(surviveTicks, 1, 240);
 
     // Save the present (post-swallowed-death) state so a failed rescue is lossless.
-    CheckpointObject* cur = pl->createCheckpoint();
-    if (cur) cur->retain();
+    CheckpointObject* curCp = pl->createCheckpoint();
+    if (curCp) curCp->retain();
     auto savedQueue = pl->m_queuedButtons; // real inputs waiting for the next tick
 
     bool committed = false;
@@ -270,10 +270,10 @@ inline bool tryRescue(GJBaseGameLayer* self, PlayLayer* pl, Step cur) {
 
     pl->m_queuedButtons = savedQueue;
     if (!committed) {
-        pl->loadFromCheckpoint(cur);
+        pl->loadFromCheckpoint(curCp);
         applyHeldState(self, g.log, T + 1);
     }
-    if (cur) cur->release();
+    if (curCp) curCp->release();
     return committed;
 }
 
